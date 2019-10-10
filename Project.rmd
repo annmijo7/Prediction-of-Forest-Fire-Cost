@@ -1,0 +1,618 @@
+---
+title: "Cost Model Report: Sector E01"
+subtitle: "MDA9144: Data Consulting"
+author: Alyssa Gagne and Ann Joseph
+date: 'March 17th, 2019'
+geometry: margin = 1.91cm
+fontsize: 12pt
+header-includes:
+- \usepackage{float}
+- \usepackage{booktabs}
+- \floatplacement{figure}{H}
+- \usepackage{setspace}
+output: 
+  pdf_document:
+    latex_engine: pdflatex
+    fig_caption: yes
+    keep_tex: yes
+---
+\vsize=9truein
+\hsize=7truein
+\raggedright
+\raggedbottom
+\doublespacing
+
+\newpage
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(mgcv)
+library(DataExplorer)
+library(dplyr)
+library(corrplot)
+library(earth)     # fit MARS models
+library(caret)     # automating the tuning process
+library(vip)       # variable importance
+library(pdp)       # variable relationships
+library(rsample)   # data splitting 
+library(randomForest) #fit random forests 
+library(MASS) 
+library(ggraph) #graph random forest
+library(igraph) #graph random forest
+library(varhandle)
+library(tidyverse)
+library(broom)
+library(glmnet)
+library(knitr)
+opts_chunk$set(echo = TRUE, fig.pos= "H")
+library(xtable)
+# Preset some options for printing your xtables
+options(xtable.caption.placement = 'top',
+        xtable.include.rownames = TRUE,
+        xtable.comment = FALSE,
+        xtable.booktabs = TRUE)
+#Data Cleaning
+#read in csv
+fire <- read.csv(file = "C:\\Users\\annjo\\Desktop\\MDAWestern\\2ndSem\\Data Consulting\\Project\\Team1Costs.csv")
+#str(fire)#remove cost 
+fire <- fire[-951,]
+#remove all observations where the cost was 0
+attach(fire)
+fire <- fire[ which(COST >0),]
+detach(fire)
+which( colnames(fire)=="S_REP_DATE" )
+#Eliminating predcitors that are unecessary
+fire<- fire[,-c(1, 3 , 5:8, 11 , 14 ,15,23,35,40:44,50:54,69)]
+#Including the real year of the fire
+year <- format.Date(as.Date(fire$START_DATE,"%d/%m/%Y"), "%Y")
+fire <- mutate(fire, realyear = year)
+fire$realyear <- as.numeric(fire$realyear)
+str(fire)
+#Difference represents the length of time the fire ran
+fire <- mutate(fire, difference = as.numeric(as.Date(fire$OUT_DATE,"%d/%m/%Y")-as.Date(fire$START_DATE,"%d/%m/%Y")))
+#Use the log of the cost for it to follow a normal distribution (not skewed)
+fire$realcost <- fire$COST
+fire$COST <- log(fire$COST)
+
+fire$START_DATE<-unfactor(fire$START_DATE)
+fire$OUT_DATE<-unfactor(fire$OUT_DATE)
+fire$BHE_DATE<-unfactor(fire$BHE_DATE)
+fire$UCO_DATE<-unfactor(fire$UCO_DATE)
+fire$DISC_DATE<-unfactor(fire$DISC_DATE)
+fire$ATTACK_DAT<-unfactor(fire$ATTACK_DAT)
+fire$GETAWAY_DA<-unfactor(fire$GETAWAY_DA)
+
+#turn specific predictors to categorical variables
+
+#When the difference between start and end date <6 and a date is missing
+#if the BHE_DATE or UCO_DATE are missing, they are set to the end date
+#if the DISC_DATE, ATTACK_DAT or GETAWAY_DA are missing then replace with startdate
+for (n in 1:(nrow(fire)-1)){
+  diffgood <- (fire[n,49]<=6)
+  bheempty <- ((fire[n,16])=="")
+  ucoempty <-((fire[n,17])=="")
+  discempty <- ((fire[n,12])=="")
+  attackempty <- ((fire[n,15])=="")
+  getawayempty <- ((fire[n,14])=="")
+  startdate <- (fire[n,11])
+  enddate <- (fire[n,18])
+  if(diffgood){
+    if(bheempty){
+      fire[n,16] <- enddate #BHE_DATE
+    }
+    if(ucoempty){
+      fire[n,17] <- enddate #UCO_DATE
+    }
+    if(discempty){
+      fire[n,12] <- startdate #DISC_DATE
+    }
+    if(attackempty){
+      fire[n,15] <- startdate #ATTACK
+    }
+    if(getawayempty){
+      fire[n,14] <- enddate #GETAWAY
+    }
+
+  }
+}
+#unique(fire$ATTACK_DAT)
+#rid of rows where we have missing data AND a difference between start and end data greater than 6
+fire <- fire[-c(250,300,487,507,540,563,579,818,836,907,1178,1193),]
+hold2 <- fire %>%
+   dplyr::select(difference, BHE_DATE , UCO_DATE,ATTACK_DAT,GETAWAY_DA,DISC_DATE, realcost)%>%
+   filter((BHE_DATE)=="")
+
+fire$START_DATE <- as.Date(fire$START_DATE,"%d/%m/%Y")
+fire$BHE_DATE <- as.Date(fire$BHE_DATE,"%d/%m/%Y")
+fire$UCO_DATE <- as.Date(fire$UCO_DATE,"%d/%m/%Y")
+fire$ATTACK_DAT <- as.Date(fire$ATTACK_DAT,"%d/%m/%Y")
+fire$DISC_DATE <- as.Date(fire$DISC_DATE,"%d/%m/%Y")
+fire$OUT_DATE <- as.Date(fire$OUT_DATE,"%d/%m/%Y")
+fire$GETAWAY_DA <- as.Date(fire$GETAWAY_DA,"%d/%m/%Y")
+
+fire$difference_attack = as.numeric(as.Date(fire$OUT_DATE,"%d/%m/%Y")-as.Date(fire$ATTACK_DAT,"%d/%m/%Y"))
+
+fire$IA_SUCCESS <- as.factor(fire$IA_SUCCESS)
+fire$NEAR_VALUES <- as.factor(fire$NEAR_VALUES)
+fire$WUI_ON <- as.factor(fire$WUI_ON)
+fire$WII_ON <- as.factor(fire$WII_ON)
+fire$INF_ON <- as.factor(fire$INF_ON)
+
+
+for(n in 1:(nrow(fire)-1)){
+  if(fire[n,47] == "?"){
+    if(fire[n,51] == 0){
+      fire[n,47] <- 1
+    }
+    else{
+      fire[n,47] <- 0
+    }
+  }
+}
+
+#store which fires had an unsuccesful initial attack
+fire_ia<-which(fire$IA_SUCCESS==0)
+
+ia_unsuccess<-fire[fire_ia,]
+#Removing IA unsuccessful
+fire<-fire[-fire_ia,]
+#fire <- fire[,-IA_SUCCESS]
+
+hold3<-fire%>%
+   dplyr::select(difference_attack,IA_SUCCESS,OUT_DATE,ATTACK_DAT)%>%
+   filter(IA_SUCCESS=="?")
+#removing outliers
+#outliers: airtankers 3,4 or cost < 150000
+#which(fire$AIR_TANKER>2 | fire$realcost>150000)
+fire<-fire[-c(176,484,1161,1244,1102,1134),]
+#remove columns IA_SUCCESS(only have 1s now).difference, difference_attack and real_cost as they were just used for data cleaning
+fire <- fire[,-c(47,49, 50, 51)]
+
+str(fire)
+
+#description of all predcitors we used
+#must add in all predcitors we used in left column (without ' ') and to the right the description
+#data dictionary
+datat2 <- tibble(
+  DITRICT = "District, a geographic subunit of region",
+  CAUSE = "Cause of the fire: lightning, person, or unknown",
+  ISI = "Initial Spread Index",
+  BUI = "Build-up Index",
+  SIMPLE_FUEL = "Categorical variable depending on fuel type",
+  DISCOVERY_SIZE = "Estimated size of the fire at the time of its discovery in hectares (ha)",
+  SIZE_INT_A = "Estimated size of the fire at the time of initial attack in hectares (ha)",
+  LOC_ATTACK = "Location of attack, e.g. head, flank no IA etc",
+  GROUND_FOR = "Number of fire fighters first responding on day 1",
+  AIR_TANKER = "Number of airtankers used during initial attack",
+  START_DATE = "Start date of fire",
+  DISC_DATE = "Date the fire was discovered",
+  F_REP_DATE = "Date the fire was first reported to MNRF",
+  GETAWAY_DA = "Date the initial attack resources left to travel to fight the fire",
+  ATTACK_DAT = "Date the initial attack resources began fighting the fire",
+  BHE_DATE = "Date the fire was declared BEING HELD",
+  UCO_DATE = "Date the fire was declared UNDER CONTROL",
+  OUT_DATE = "Date the fire was declared OUT",
+  FINAL_SIZE = "Final size of the fire in hectares",
+  LONGITUDE = "Longitude in degrees from prime meridian",
+  LATITUDE = "Latitude in degrees from equator",
+  KM_FMH = "Distance, in km, from the fire to the nearest Fire Management Headquarters",
+  KM_AB = "Distance, in km, from the fire to the nearest Attack Base",
+  KM_FAB = "Distance, in km, from the fire to the nearest Forward Attack Base",
+  ISI2 = "Initial Spread Index (on day 2 of the fire)",
+  ISI3 = "Initial Spread Index (on day 3 of the fire)",
+  ISI4 = "Initial Spread Index (on day 4 of the fire)",
+  ISI5 = "Initial Spread Index (on day 5 of the fire)",
+  PROB_EVENT = "Probability of a spread event using ISI on day 1",
+  PROB_EVE_1 = "Probability of a spread event using ISI on day 2",
+  PROB_EVE_2 = "Probability of a spread event using ISI on day 3",
+  PROB_EVE_3 = "Probability of a spread event using ISI on day 4",
+  PROB_EVE_4 = "Probability of a spread event using ISI on day 5",
+  COUNT_SPRE = "Count of spread event days (spread event day:ISI-based spread event probability exceeds 50%)",
+  SUM_SPREAD = "Sum of ISI-based daily spread event probabilities over the life of fire",
+  SUM_SPRE_1 = "Sum of ISI-based daily spread event probabilities up to day 14",
+  COUNT_SP_1 = "Count of spread event days (spread event day:FWI-based spread event probability exceeds 50%)",
+  SUM_SPRE_2 = "Sum of FWI-based daily spread event probabilities over the life of fire",
+  SUM_SPRE_3 = "Sum of FWI-based daily spread event probabilities up to day 14",
+  ECOREGION = "Spatial partition into units that are ecological similar",
+  INF_ON = "Binary indicator for whether the fire was within an infrastructure class",
+  WII_ON = "Binary indicator for whether the fire was within a Wildland Industrial Interface class",
+  WUI_ON = "Binary indicator for whether the fire was within the Wildland Urban Interface class",
+  Number.of.Interface = "Number of interface classes the fire was within.",
+  NEAR_VALUES = "Binary indicator for whether the fire was within a 16 km buffer of highways, railways or towns",
+  IA_SUCCESS = "Binary indicator for whether initial attack efforts on the fire were deemed successful",
+  realyear = " Variable created by extracting the year of fire from START_DATE"
+)
+
+tb2 <- as.data.frame(datat2)
+rownames(tb2) <- c("Description of Predictors")
+tblevel <- t(tb2)
+
+
+datat3 <- tibble(
+'CO' = "Coniferous - volatile behavior",
+'DE' = "Deciduous - less volatile  ",
+'MX' = "Mixedwood -behavior depends on ratio of coniferous to deciduous mix",
+'SL' = "Slash - drys quickly but slower spread than grass",
+'OP' = "Open - dries quickly, spreads quickly",
+'UNK' = "Unknown",
+'OT' = "Other"
+)
+tb3 <- as.data.frame(datat3)
+rownames(tb3) <- c("Type of Fuel")
+tbdescrip <- t(tb3)
+```
+
+##Executive Summary
+
+We will work on this later
+This report serves to allow fire managers at the *Ministry of Natural Resources and Forestry* to better estimate the cost of a fire. The sector of Ontario dealt with in this report was Sector 1 which contains $3$ districts; *Pembroke*, *Algonquin Park* and *Bancroft*.It explains how the data was first cleaned and different means were used to estimate data missing. The data was explored to determine different outlier observations of fires, along with plots created to better understand the variables that were cost drivers.A plot was used to indicate the district with the most number of fires, which was *Bancroft*.Three models were built to estimate the cost; MARS model, LASSO model, RIDGE model. The model that performed the best was MARS.
+
+\newpage
+##Introduction
+
+Forest fire season in Canada occurs every year, with hundreds of fires starting by either a lightning strike or human activity. Some of these fires are monitored, while others need to be extinguished immediately, usually due to proximity of civilization. The *Ministry of Natural Resources and Forestry*'s fire managers are given the task of making crucial decisions about distributing firefighting resources and ranking priorities. The fire managers must assess which fires pose the largest threats and decide which type of resources are needed where. This report serves to best model a cost function in determining the cost of a fire given the information collected. Using this data, fire managers can better estimate the cost of a fire and allocate their resources better.
+
+\vspace{12pt}
+
+![Sector 1 of Ontario.](/Users/alyssagagne/Desktop/MDA\ -\ general/Semester\ 2/Data\ Consulting\map_fire.png)
+
+\newpage
+```{r, eval= FALSE, echo=FALSE}
+print(xtable(tblevel),floating = FALSE, type="latex")
+```
+
+```{r, eval=FALSE, echo=FALSE}
+print(xtable(tbdescrip),floating = FALSE, type="latex")
+```
+
+##Data and Study Area
+
+The dataset used for this project consists of data collected over the course of 18 years by the *MNRF*.It includes different fires that occured over Sector 1 of Ontario which consists of *three* districts : `Pembroke`, `Algonquin Park` and `Bancroft` , depicted in Figure 1. Originally there were a total of $1493$ observations with $68$ $predictors$ such as `SIMPLE_FUEL` , `DISCOVERY_SIZE` and `AIR_TANKER`. A description of all the $predictors$ that were used are found in Table 1 and a description of each of the seven types of simple fuels can be found in Table 2 and both tables can be found in *Appendix A*.
+
+###Data Cleaning
+Prior to dealing with any types of missing values in the dataset, we needed to decided which $variables$ we did not want to include in the modelling process. After research was done on what all the different $variables$ represented and measured, it was noted the predictors BUI and FWI were constructed using *Fine Fuel Moisture Code* (*FFMC*), *Duff Moisture Code* (*DMC*), *Drought Code* (*DC*) and wind speeds. Therefore *FFMC*, *DMC* and *DC* were eliminated from the set of $predictors$. In addition, the  $predictor$ `OBJECTIVE` was excluded as all observations in the dataset had an objective of full supression except for $1$ observation, which was excluded. This single observation had an `OBJECTIVE` of being *monitored*, however without enough observations with this `OBJECTIVE`, we cannot accurately predict for this type of fire. Due to the geographical location of Sector 1, it is plausible that there was only one *monitored* fire as all the three districts in the sector either are sufficiently populated, or are Provincial Parks. Lastly, the predictor `IA_SUCCESS`, a binary variable, had only $30$ observations with an unsuccessful initial attack, a value of $0$. Due to the lack of fires with an unsuccessful initial attack, these $30$ observations were removed from the data set. Despite the fires with an unsuccessful initial attack being excluded from the cost modelling process, they were explored in detail in the *Exploratory Analysis* section.
+
+A logarithmic transformation was applied to the response variable `COST`, in order to ensure it followed a *Normal Distribution*. When creating a statistical model, it is important the response variable follows a *Normal Distribution*, which means the variable's values are distributed amongst its possibities with roughly $70$% of the data around the mean and less and less observations with the more extreme values. A logarithmic transformation of a variable is one of the most common choices because data more commonly follows a log-normal distribution, therefore with the transformation follows a *Normal Distribution*.
+
+To ensure the highest level of data quality, different approaches were used to estimate different types of missing data.
+There were several missing dates for the predictors `BHE_DATE` and `UCO_DATE`. All missing `BHE_DATE` and `UCO_DATE` where the fire lasted less than $6$ days were estimated as the `OUT_DATE` rather than being dropped since the length of the fires were short enough to assume the *Being held date* and *Under control date* were the same as the date the fire went out. However the observations, with one of these dates missing and an overall duration of more than $6$ days, were deleted. In addition, missing `DISC_DATE`, `GETAWAY_DA` and `ATTACK_DAT` were estimated if the fire lasted $6$ days or less, to the `START_DATE`. Any fires with a duration of more than $6$ days, with one of these dates missing, were deleted. For missing `IA_SUCCESS` values, which are given a binary 0 or 1 based on if the initial attack was successful, we filled in all missing values based on if the `ATTACK_DAT` was equal to the `OUT_DATE`. We gave the `IA_SUCCESS` a value of $1$ (success) if they were equal and all others a value of $0$.
+
+
+\newpage
+###Exploratory Analysis
+Figure 2 indicates that fires with fuel type of *Coniferous* are the most numerous and costly, in general. In addition, the most common cause of fires in all three districts are human related.
+\vspace{12pt}
+
+```{r, echo=FALSE, fig.cap= "Variation on Cost by Fuel type and Cause of fire",results="asis",fig.pos="H",fig.height= 3, fig.width= 4}
+ggplot(fire) +
+  geom_col(aes(x = SIMPLE_FUEL,y=log(COST),fill=CAUSE)) +
+  xlab("Fuel Type") + ylab("Cost") + scale_fill_discrete(name="CAUSE")
+```
+
+Figure 4 indicates that the district of *Bancroft* has had the most number of fires in the last 18 years. In addition, it indicates that almost all fires in both *Bancroft* and *Pembroke* were within 16 km of highways, railways or towns, therefore close to civilization.
+
+\vspace{12pt}
+
+```{r , echo=FALSE, fig.cap= "Number of Fires per district by proximity to civilization",results="asis",fig.pos="H",fig.height= 3, fig.width= 4}
+ggplot(fire) +
+  geom_bar(aes(x = DISTRICT, y = ..count.., fill = as.factor(NEAR_VALUES))) +
+  xlab("District") + ylab("Number of fires") + scale_fill_discrete(name="Near Values", labels=c("No","Yes"))
+```
+
+\newpage
+##Results
+
+Three models were created to best estimate the cost of a fire given the information collected. The three models constructed were MARS, LASSO and Ridge. Models were compared using *Mean Square Error (MSE)*, which measure the average error between the estimated cost and the actual cost and the *adjusted $R^2$ *, which determines how well a model fits the data.
+\vspace{12pt}
+
+###MARS Model
+
+```{r echo= FALSE}
+
+# Splitting the data into 70,30
+smp_size <- floor(0.70 * nrow(fire))
+set.seed(123)
+train_ind <- sample(seq_len(nrow(fire)), size = smp_size)
+
+train <- fire[train_ind, ]
+test <- fire[-train_ind, ]
+
+#Fitting a MARS model
+
+mars1 <- earth(COST ~ .,data = train)
+
+
+
+#summary(mars1) %>% .$coefficients %>% head(10)
+
+#plot(mars1)
+set.seed(123)
+
+# cross validated model
+
+ctrl <- trainControl(method="cv", number=10)
+ansMARSCaret <- train(COST~., data=train,#formula notation works provided ok with method
+                 method="gcvEarth",
+                 tuneGrid=data.frame(degree=c(1,2)),
+                 trControl=ctrl)
+varImp((ansMARSCaret))
+#ansMARSCaret$bestTune
+mars_pred<-predict(ansMARSCaret, test)
+#can calcualte the MSE and R^2
+
+sse_mars <- sum((mars_pred - test$COST)^2)
+sst <- sum((test$COST - mean(test$COST))^2)
+# R squared
+rsq_mars <- 1 - (sse_mars / sst)
+#rsq_mars
+#0.7345 R2 
+
+MSE_mars <- mean((mars_pred-test$COST)^2)
+MSE_mars
+#MSE of 1.0379
+
+```
+
+A MARS model creates a piece-wisestep function made up of individual linear segments. The *MSE* of the model constructed was `r MSE_mars`. The *adjusted $R^2$ * was `r rsq_mars`.
+
+
+```{r, echo=FALSE, results= "asis"}
+knitr::kable(summary(ansMARSCaret) %>% .$coefficients %>% head(10), caption = "First 10 coefficients of MARS model")
+```
+
+Table 3 includes the first ten predictors in the MARS model with their respective coefficients.
+
+###LASSO Model
+
+```{r include= FALSE}
+#which( colnames(fire)=="COST" )
+x <- model.matrix(COST~., fire)[,-40]
+y <- fire$COST
+lambda <- 10^seq(10, -2, length = 100)
+
+set.seed(489)
+train = sample(1:nrow(x), nrow(x)*0.7)
+test = (-train)
+ytest = y[test]
+
+lasso.mod <- glmnet(x[train,], y[train], alpha = 1, lambda = lambda)
+#plot(lasso.mod, xvar = "lambda", label = TRUE,lwd=2,main="LASSO")
+
+#find the best lambda from our list via cross-validation
+cv.out <- cv.glmnet(x[train,], y[train], alpha = 1)
+#plot(cv.out)
+
+bestlam <- cv.out$lambda.min
+fit_lasso_best = glmnet(x[train,], y[train], alpha = 1, lambda = bestlam)
+
+# See that the LASSO does a variable selection
+#round(coef(fit_lasso_best),4)
+
+lasso.pred <- predict(fit_lasso_best, s = bestlam, newx = x[test,])
+
+MSE_lasso <-mean((lasso.pred-ytest)^2)
+#MSE_lasso 
+#MSE of lasso is 1.02
+
+sst <- sum((ytest - mean(ytest))^2)
+sse_lasso <- sum((lasso.pred - ytest)^2)
+
+# R squared
+rsq_lasso <- 1 - (sse_lasso / sst)
+#rsq_lasso
+#R2 lasso is 0.709
+```
+
+A LASSO model creates a function similar to a logarithmic function, with an added penalty term that has as goal to shrink unnecessary coefficients to zero. The *MSE* of the model constructed was `r MSE_lasso`. The *adjusted $R^2$ * was `r rsq_lasso`.
+
+
+```{r, echo=FALSE, results= "asis"}
+lasso_data <- tibble(
+'DISTRICTPEM' = "-0.1648",
+'CAUSEPER' = "-0.1863",
+'CAUSEUNK' = "-0.1437",
+'BUI' = "0.0038",
+'SIMPLE_FUELMIX' = " 0.0584",
+'SIMPLE_FUELOP' = "-0.5714",
+'SIMPLE_FUELOT' = "-0.2210"
+)
+lass <- as.data.frame(lasso_data)
+rownames(lass) <- c("Type of Fuel")
+tblasso <- t(lass)
+
+```
+
+```{r, results="asis", echo=FALSE, fig.pos="H"}
+print(xtable(tblasso),floating = FALSE, type="latex")
+```
+\begin{table}[ht]
+\caption{First 7 coefficients of Lasso model}
+\end{table}
+Table 4 includes the first ten predictors in the LASSO model with their respective coefficients.
+
+###Ridge Model
+
+```{r echo=FALSE}
+
+ridge_model <- glmnet(x[train,],y[train], alpha = 0, lambda = lambda)
+#summary(ridge_model)
+#we must choose the optimal lambda
+cv_fit <- cv.glmnet(x[train,], y[train], alpha = 0, lambda = lambda)
+
+#must choose optimal lambda
+#plot(cv_fit)
+opt_lambda <- cv_fit$lambda.min
+#optimal lambda is 2.00
+
+fit <- cv_fit$glmnet.fit
+#summary(fit)
+
+ridge_predicted <- predict(fit, s = opt_lambda, newx = x[test,])
+
+#can calcualte the MSE and R^2
+
+sse_rid <- sum((ridge_predicted - ytest)^2)
+
+# R squared
+rsq_rid <- 1 - (sse_rid / sst)
+#rsq_rid
+#0.668 R2 
+
+MSE_rid <- mean((ridge_predicted-ytest)^2)
+#MSE_rid
+#MSE of 1.16
+```
+
+A RIDGE model creates a function similar to a logarithmic function, with an added penalty term that has as goal reduces the magnitude of the coefficients that contribute most to the erro.. The *MSE* of the model constructed was `r MSE_rid`. The *adjusted $R^2$ * was `r rsq_rid`.
+
+```{r echo = FALSE}
+ridge_data <- tibble(
+'DISTRICTBAN' = "0.1955912627",
+'DISTRICTPEM' = "-0.2852577484",
+'CAUSEPER' = "-0.3012741361",
+'CAUSEUNK' = "-0.3931431712",
+'BUI' = "0.0005449829",
+'ISI' = "-0.0026513220",
+'SIMPLE_FUELMIX' = "0.1171500231"
+)
+rid <- as.data.frame(ridge_data)
+rownames(rid) <- c("Type of Fuel")
+tbrid <- t(rid)
+```
+
+```{r, results="asis", echo=FALSE, fig.pos="H"}
+print(xtable(tbrid),floating = FALSE, type="latex")
+```
+\begin{table}[ht]
+\caption{First 7 coefficients of Ridge model}
+\end{table}
+Table 5 includes the first ten predictors in the RIDGE model with their respective coefficients.
+
+##GAM
+
+```{r}
+
+gam_H_1 <- mgcv::gam(COST ~  s(ISI) + s(BUI) + s(log10(SIZE_INT_A)) + SIMPLE_FUEL + INF_ON + WUI_ON + Number.of.Interface +  s(log10(KM_FMH)) + s(log10(KM_AB)) + s(log10(KM_FAB))  + s(GROUND_FOR) + s(PROB_EVENT) + COUNT_SPRE + s(LONGITUDE) + s(SUM_SPRE_2) + s(AIR_TANKER, k=4) + LOC_ATTACK , select=TRUE, data=train)
+summary(gam_H_1) #71%
+gam_pred1<-predict.gam(gam_H_1, test, type="response")
+
+MSE_gam1 <- mean((gam_pred1-test$COST)^2)
+MSE_gam1
+#MSE of 0.864
+
+str(train)
+
+
+gam_H_2 <- mgcv::gam(COST ~  s(ISI) + s(BUI) + SIZE_INT_A + SIZE_INT_A + SIMPLE_FUEL + INF_ON + WUI_ON + Number.of.Interface +  s(log10(KM_FMH)) + s(log10(KM_AB)) + KM_FAB  + s(GROUND_FOR) + s(PROB_EVENT) + COUNT_SPRE + s(LONGITUDE) + s(SUM_SPRE_2) + s(AIR_TANKER, k=4) + LOC_ATTACK , select=TRUE, data=train)
+summary(gam_H_2) #71.1
+plot(gam_H_2)
+gam_pred2<-predict.gam(gam_H_2, test, type="response")
+
+MSE_gam2 <- mean((gam_pred2-test$COST)^2)
+MSE_gam2
+
+#MSE of 7.426538
+
+
+preds   <- predict(gam_H_1,newdata = test, se.fit = TRUE)
+my_data <- data.frame(test,
+                      logCOST = test$COST,
+                      mu   = preds$fit,
+                      low  = preds$fit - 1.96 * preds$se.fit,
+                      high = preds$fit + 1.96 * preds$se.fit)
+
+my_data_ordered <- arrange(my_data,logCOST)
+head(my_data_ordered)
+#my_data_ordered <- my_data[order(logCOST),] 
+my_data_ordered <- tibble::rowid_to_column(my_data_ordered, "ID")
+head(my_data_ordered)
+
+PI <- ggplot(my_data_ordered, aes(x = ID, y = mu)) +
+  geom_point(size = 1) +
+  geom_point(aes(x = ID, y = logCOST), col = 12, size = 0.5) +
+  geom_errorbar(aes(ymax = high, ymin = low))
+PI + ylab("logcost")
+
+```
+```{r}
+
+fire <- fire[,-c(10,14:19,34:39,47)]
+
+# Splitting the data into 70,30
+smp_size <- floor(0.70 * nrow(fire))
+set.seed(123)
+train_ind <- sample(seq_len(nrow(fire)), size = smp_size)
+
+train <- fire[train_ind, ]
+test <- fire[-train_ind, ]
+#Fitting a MARS model
+
+mars1 <- earth(COST ~ .,data = train)
+
+set.seed(123)
+
+# cross validated model
+
+ctrl <- trainControl(method="cv", number=10)
+ansMARSCaret <- train(COST~., data=train,#formula notation works provided ok with method
+                      method="gcvEarth",
+                      tuneGrid=data.frame(degree=c(1,2)),
+                      trControl=ctrl)
+ansMARSCaret$bestTune
+mars_pred<-predict(ansMARSCaret, test)
+varImp(ansMARSCaret)
+#can calcualte the MSE and R^2
+
+sse_mars <- sum((mars_pred - test$COST)^2)
+sst <- sum((test$COST - mean(test$COST))^2)
+# R squared
+rsq_mars <- 1 - (sse_mars / sst)
+rsq_mars
+#0. R2 
+
+MSE_mars <- mean((mars_pred-test$COST)^2)
+MSE_mars
+#MSE of 1.0379
+
+#GAM
+
+#First model
+gam1 <- mgcv::gam(COST ~ SIMPLE_FUEL + INF_ON + WII_ON + WUI_ON + Number.of.Interface 
+                + NEAR_VALUES + s(ISI) + s(BUI)  + te(LONGITUDE,LATITUDE)
+                + s(log10(SIZE_INT_A)) + s(log10(KM_FMH)) + s(log10(KM_AB)) + s(log10(KM_FAB)) 
+                + s(PROB_EVENT), select=TRUE, data=train)
+#gam_pred<-predict(gam1, test, type="response")
+summary(gam1) #rsq is 62%, GCV is 1.3583
+#when edf of a smooth term is close to 1, that indicates the relationship can be approximated by a linear one
+
+gam2 <- mgcv::gam(COST ~ SIMPLE_FUEL + INF_ON + WII_ON + WUI_ON + Number.of.Interface 
+                  + NEAR_VALUES + ISI + s(ISI2) + s(ISI3) + s(ISI4) + s(ISI5) + s(BUI)  + LONGITUDE + LATITUDE
+                  + s(log10(SIZE_INT_A)) + s(log10(KM_FMH)) + s(log10(KM_AB)) + KM_FAB 
+                  + PROB_EVENT + PROB_EVE_1 + PROB_EVE_2+ PROB_EVE_3 + PROB_EVE_4 + DISTRICT + CAUSE 
+                  + s(log10(DISCOVERY_SIZE)) + LOC_ATTACK , select=TRUE, data=train)
+summary(gam2) #65.2%, 1.2576
+
+gam_pred2<-predict(gam2, test, type="response")
+
+MSE_gam2 <- mean((gam_pred2-test$COST)^2)
+MSE_gam2
+#MSE of 1.071
+
+gam3 <- mgcv::gam(COST ~ SIMPLE_FUEL + INF_ON + WII_ON + WUI_ON + Number.of.Interface + s(BUI)
+                  + s(log10(SIZE_INT_A)) + s(log10(KM_FMH)) + s(log10(KM_AB)) 
+                 + CAUSE  
+                  + DISCOVERY_SIZE , select=TRUE, data=train)
+summary(gam3) #60%
+
+gam_pred3<-predict.gam(gam3, test, type="response")
+
+MSE_gam3 <- mean((gam_pred2-test$COST)^2)
+MSE_gam3
+#MSE of 1.142
+```
+
+
+##Discussion
+From the above analysis, it is observed that out of the three models constructed, the MARS model performed the best with a fit of roughly 73% and an *MSE* of 1.0067. From the above models, we also observed that variables such as `OUT_DATE` and `FINAL_SIZE` are important in the prediction of forest fire costs. We plan on building more models using algorithms such as Random Forests and Support Vector Machines and tuning their parameters to better estimate costs and understand the relationship between cost and predictors given. 
+
+Outliers were removed as a part of our data cleaning step, however as outliers are of interest to this analysis to better understand the characteristics of forest fires with large costs, one of our future plans is to build a predictive model for the large cost fires. This will allow the larger cost fires not to influence the regular model, but allow for the fire managers to still anticipate when a fire will cost more than usual. 
